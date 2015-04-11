@@ -17,7 +17,7 @@ use std::str::pattern::{Pattern, Searcher, SearchStep};
 use std::str::FromStr;
 
 use compile::Program;
-use parse;
+use regex_syntax as syntax;
 use vm;
 use vm::CaptureLocs;
 use vm::MatchKind::{self, Exists, Location, Submatches};
@@ -32,7 +32,7 @@ use self::Regex::*;
 pub fn quote(text: &str) -> String {
     let mut quoted = String::with_capacity(text.len());
     for c in text.chars() {
-        if parse::is_punct(c) {
+        if syntax::is_punct(c) {
             quoted.push('\\')
         }
         quoted.push(c);
@@ -47,7 +47,7 @@ pub fn quote(text: &str) -> String {
 ///
 /// To find submatches, split or replace text, you'll need to compile an
 /// expression first.
-pub fn is_match(regex: &str, text: &str) -> Result<bool, parse::Error> {
+pub fn is_match(regex: &str, text: &str) -> Result<bool, syntax::Error> {
     Regex::new(regex).map(|r| r.is_match(text))
 }
 
@@ -184,8 +184,8 @@ impl Regex {
     /// used repeatedly to search, split or replace text in a string.
     ///
     /// If an invalid expression is given, then an error is returned.
-    pub fn new(re: &str) -> Result<Regex, parse::Error> {
-        let ast = try!(parse::parse(re));
+    pub fn new(re: &str) -> Result<Regex, syntax::Error> {
+        let ast = try!(syntax::parse(re));
         let (prog, names) = Program::new(ast);
         Ok(Dynamic(ExDynamic {
             original: re.to_string(),

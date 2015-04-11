@@ -15,13 +15,12 @@ use self::Inst::*;
 
 use std::cmp;
 use std::iter::repeat;
-use parse;
-use parse::{Flags, FLAG_EMPTY};
-use parse::Ast::{
+use regex_syntax::{Ast, Flags, FLAG_EMPTY};
+use regex_syntax::Ast::{
     Nothing, Literal, Dot, AstClass, Begin, End, WordBoundary, Capture,
     Cat, Alt, Rep,
 };
-use parse::Repeater::{ZeroOne, ZeroMore, OneMore};
+use regex_syntax::Repeater::{ZeroOne, ZeroMore, OneMore};
 
 pub type InstIdx = usize;
 
@@ -90,7 +89,7 @@ pub struct Program {
 
 impl Program {
     /// Compiles a Regex given its AST.
-    pub fn new(ast: parse::Ast) -> (Program, Vec<Option<String>>) {
+    pub fn new(ast: Ast) -> (Program, Vec<Option<String>>) {
         let mut c = Compiler {
             insts: Vec::with_capacity(100),
             names: Vec::with_capacity(10),
@@ -145,7 +144,7 @@ struct Compiler {
 // The only tricky thing here is patching jump/split instructions to point to
 // the right instruction.
 impl Compiler {
-    fn compile(&mut self, ast: parse::Ast) {
+    fn compile(&mut self, ast: Ast) {
         match ast {
             Nothing => {},
             Literal(c, flags) => self.push(OneChar(c, flags)),

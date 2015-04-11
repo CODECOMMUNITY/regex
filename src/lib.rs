@@ -372,16 +372,16 @@
        html_favicon_url = "http://www.rust-lang.org/favicon.ico",
        html_root_url = "http://doc.rust-lang.org/regex/")]
 
-pub use parse::Error;
+extern crate regex_syntax;
+
+pub use regex_syntax::Error;
 pub use re::{Regex, Captures, SubCaptures, SubCapturesPos, SubCapturesNamed};
 pub use re::{FindCaptures, FindMatches};
 pub use re::{Replacer, NoExpand, RegexSplits, RegexSplitsN};
 pub use re::{quote, is_match};
 
 mod compile;
-mod parse;
 mod re;
-mod unicode;
 mod vm;
 
 /// The `native` module exists to support the `regex!` macro. Do not use.
@@ -407,7 +407,7 @@ pub mod native {
         Match, OneChar, CharClass, Any, EmptyBegin, EmptyEnd,
         EmptyWordBoundary, Save, Jump, Split,
     };
-    pub use parse::{
+    pub use regex_syntax::{
         FLAG_EMPTY, FLAG_NOCASE, FLAG_MULTI, FLAG_DOTNL,
         FLAG_SWAP_GREED, FLAG_NEGATED,
     };

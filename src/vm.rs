@@ -45,8 +45,7 @@ use compile::Inst::{
     Match, OneChar, CharClass, Any, EmptyBegin, EmptyEnd, EmptyWordBoundary,
     Save, Jump, Split,
 };
-use parse::{FLAG_NOCASE, FLAG_MULTI, FLAG_DOTNL, FLAG_NEGATED};
-use unicode::regex::PERLW;
+use regex_syntax::{FLAG_NOCASE, FLAG_MULTI, FLAG_DOTNL, FLAG_NEGATED, is_word};
 use unicode::case_folding;
 
 pub type CaptureLocs = Vec<Option<usize>>;
@@ -508,31 +507,6 @@ impl Threads {
     }
 }
 
-/// Returns true if the character is a word character, according to the
-/// (Unicode friendly) Perl character class '\w'.
-/// Note that this is only use for testing word boundaries. The actual '\w'
-/// is encoded as a CharClass instruction.
-pub fn is_word(c: Option<char>) -> bool {
-    let c = match c {
-        None => return false,
-        Some(c) => c,
-    };
-    // Try the common ASCII case before invoking binary search.
-    match c {
-        '_' | '0' ... '9' | 'a' ... 'z' | 'A' ... 'Z' => true,
-        _ => PERLW.binary_search_by(|&(start, end)| {
-            if c >= start && c <= end {
-                Ordering::Equal
-            } else if start > c {
-                Ordering::Greater
-            } else {
-                Ordering::Less
-            }
-        }).ok().is_some()
-    }
-}
-
-
 /// Returns the Unicode *simple* case folding of `c`.
 /// Uses the mappings with status C + S form Unicode’s `CaseFolding.txt`.
 /// This is not as “correct” as full case folding, but preserves the number of code points.
@@ -542,7 +516,6 @@ pub fn simple_case_fold(c: char) -> char {
         Err(_) => c
     }
 }
-
 
 /// Given a character and a single character class range, return an ordering
 /// indicating whether the character is less than the start of the range,
