@@ -4,7 +4,7 @@ pub enum Expr {
     LiteralString { s: String, casei: bool },
     AnyChar,
     AnyCharNoNL,
-    Class { ranges: Vec<ClassRange>, casei: bool },
+    Class { ranges: CharClass, casei: bool },
     StartLine,
     EndLine,
     StartText,
@@ -25,8 +25,10 @@ pub enum ExprRepeat {
     Range { start: Option<u32>, end: Option<u32> },
 }
 
+pub struct CharClass(Vec<ClassRange>);
+
 pub struct ClassRange {
     // invariant: start < end
-    start: char,
-    end: char,
+    pub start: char,
+    pub end: char,
 }
