@@ -1,7 +1,8 @@
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Expr {
     Empty,
     Literal { c: char, casei: bool },
-    LiteralString { s: String, casei: bool },
+    LiteralString { s: Vec<char>, casei: bool },
     AnyChar,
     AnyCharNoNL,
     Class { ranges: CharClass, casei: bool },
@@ -11,13 +12,18 @@ pub enum Expr {
     EndText,
     WordBoundary,
     NotWordBoundary,
-    Capture { e: Box<Expr>, i: u32, name: Option<String> },
-    Repeat { e: Box<Expr>, r: ExprRepeat, greedy: bool },
+    Capture { e: Box<Expr>, i: CaptureIndex, name: CaptureName },
+    Repeat { e: Box<Expr>, r: Repeat, greedy: bool },
     Concat(Vec<Expr>),
     Alternate(Vec<Expr>),
 }
 
-pub enum ExprRepeat {
+pub type CaptureIndex = u32;
+
+pub type CaptureName = Option<String>;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Repeat {
     ZeroOrOne,  // ?
     ZeroOrMore, // *
     OneOrMore,  // +
@@ -25,8 +31,10 @@ pub enum ExprRepeat {
     Range { start: Option<u32>, end: Option<u32> },
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CharClass(Vec<ClassRange>);
 
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ClassRange {
     // invariant: start < end
     pub start: char,
