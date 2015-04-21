@@ -12,7 +12,7 @@
 
 pub use parser::{Error, ErrorKind, Result};
 pub use syntax::{
-    Expr, Repeat, CharClass, ClassRange, CaptureIndex, CaptureName,
+    Expr, Repeater, CharClass, ClassRange, CaptureIndex, CaptureName,
 };
 
 mod parser;

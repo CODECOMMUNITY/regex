@@ -1,4 +1,6 @@
-use {Expr, Repeat, CharClass, ClassRange, CaptureIndex, CaptureName};
+use std::cmp::{max, min};
+use std::ops::{Deref, DerefMut};
+use {Expr, Repeater, CharClass, ClassRange, CaptureIndex, CaptureName};
 
 macro_rules! pushe {
     ($_self:expr, $e:expr) => ({ let e = $e; $_self.stack.push_expr(e); });
@@ -6,21 +8,22 @@ macro_rules! pushe {
 
 pub type Result<T> = ::std::result::Result<T, Error>;
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Error {
-    pub pos: usize,
+    pub pos: i32,
     pub surround: String,
     pub kind: ErrorKind,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ErrorKind {
-    RepeatExpectsExpr,
+    RepeaterExpectsExpr,
+    RepeaterUnexpectedExpr(Expr),
 }
 
-struct ExprBuilder(Vec<ExprBuild>);
+struct Builder(Vec<Build>);
 
-enum ExprBuild {
+enum Build {
     Expr(Expr),
     LeftParen { i: CaptureIndex, name: CaptureName },
     Alt,
@@ -28,8 +31,8 @@ enum ExprBuild {
 
 struct Parser {
     chars: Vec<char>,
-    chari: usize,
-    stack: ExprBuilder,
+    chari: i32,
+    stack: Builder,
     caps: usize,
 }
 
@@ -38,7 +41,7 @@ impl Parser {
         Parser {
             chars: s.chars().collect(),
             chari: 0,
-            stack: ExprBuilder::new(),
+            stack: Builder::new(),
             caps: 0,
         }.parse_expr()
     }
@@ -49,65 +52,95 @@ impl Parser {
         }
         while !self.eof() {
             let c = self.cur();
-            match c {
-                '?' => {
-                    self.bump();
-                    try!(self.parse_simple_repeat(Repeat::ZeroOrOne));
-                }
-                '*' => {
-                    self.bump();
-                    try!(self.parse_simple_repeat(Repeat::ZeroOrMore));
-                }
-                '+' => {
-                    self.bump();
-                    try!(self.parse_simple_repeat(Repeat::OneOrMore));
-                }
-                '^' => { self.bump(); pushe!(self, Expr::StartText) }
-                '$' => { self.bump(); pushe!(self, Expr::EndText) }
-                '.' => { self.bump(); pushe!(self, Expr::AnyCharNoNL) }
-                c => {
-                    let lit = Expr::Literal { c: self.bump(), casei: false };
-                    pushe!(self, lit);
-                }
-            }
+            let build_expr = match c {
+                '?' => try!(self.parse_simple_repeat(Repeater::ZeroOrOne)),
+                '*' => try!(self.parse_simple_repeat(Repeater::ZeroOrMore)),
+                '+' => try!(self.parse_simple_repeat(Repeater::OneOrMore)),
+                '^' => self.parse_one(Expr::StartText),
+                '$' => self.parse_one(Expr::EndText),
+                '.' => self.parse_one(Expr::AnyCharNoNL),
+                c => Build::Expr(Expr::Literal {
+                    c: self.bump(),
+                    casei: false,
+                }),
+            };
+            self.stack.push(build_expr);
         }
         Ok(self.stack.collapse())
     }
 
-    fn parse_simple_repeat(&mut self, rep: Repeat) -> Result<()> {
-        let e = try!(self.pop(ErrorKind::RepeatExpectsExpr));
-        Ok(pushe!(self, Expr::Repeat { e: Box::new(e), r: rep, greedy: true }))
+    fn parse_simple_repeat(&mut self, rep: Repeater) -> Result<Build> {
+        let e = try!(self.pop(ErrorKind::RepeaterExpectsExpr));
+        if !e.can_repeat() {
+            return Err(self.err(ErrorKind::RepeaterUnexpectedExpr(e)));
+        }
+        self.bump();
+        Ok(Build::Expr(Expr::Repeat {
+            e: Box::new(e),
+            r: rep,
+            greedy: !self.bump_if_eq('?'),
+        }))
+    }
+
+    fn parse_one(&mut self, e: Expr) -> Build {
+        self.bump();
+        Build::Expr(e)
     }
 }
 
 // Auxiliary helper methods.
 impl Parser {
     fn bump(&mut self) -> char { let c = self.cur(); self.chari += 1; c }
-    fn cur(&self) -> char { self.chars[self.chari] }
-    fn eof(&self) -> bool { self.chari >= self.chars.len() }
+    fn cur(&self) -> char { self.chars[self.chari as usize] }
+    fn eof(&self) -> bool { self.chari as usize >= self.chars.len() }
+
+    fn bump_if_eq(&mut self, c: char) -> bool {
+        if self.peek_is(c) {
+            self.bump();
+            true
+        } else {
+            false
+        }
+    }
+
+    fn peek_is(&self, c: char) -> bool {
+        if self.eof() {
+            false
+        } else {
+            self.cur() == c
+        }
+    }
 
     fn err(&self, kind: ErrorKind) -> Error {
-        Error { pos: 0, surround: "".into(), kind: kind }
+        self.errat(self.chari, kind)
+    }
+
+    fn errat(&self, pos: i32, kind: ErrorKind) -> Error {
+        Error { pos: pos, surround: self.windowat(pos), kind: kind }
+    }
+
+    fn windowat(&self, pos: i32) -> String {
+        let (s, e) = (max(0, pos - 5), min(self.chars.len() as i32, pos + 5));
+        self.chars[s as usize..e as usize].iter().cloned().collect()
     }
 
     fn pop(&mut self, expected: ErrorKind) -> Result<Expr> {
-        match self.stack.0.pop() {
+        match self.stack.pop() {
             None => Err(self.err(expected)),
-            Some(ExprBuild::Expr(e)) => Ok(e),
+            Some(Build::Expr(e)) => Ok(e),
             _ => unimplemented!(),
         }
     }
 }
 
-impl ExprBuilder {
-    fn new() -> ExprBuilder { ExprBuilder(vec![]) }
-    fn push_expr(&mut self, e: Expr) { self.0.push(ExprBuild::Expr(e)) }
+impl Builder {
+    fn new() -> Builder { Builder(vec![]) }
 
     fn collapse(self) -> Expr {
         let mut concat = vec![];
         for build in self.0 {
             match build {
-                ExprBuild::Expr(e) => { concat.push(e); }
+                Build::Expr(e) => { concat.push(e); }
                 _ => unimplemented!(),
             }
         }
@@ -122,12 +155,22 @@ impl ExprBuilder {
     }
 }
 
+impl Deref for Builder {
+    type Target = Vec<Build>;
+    fn deref(&self) -> &Vec<Build> { &self.0 }
+}
+
+impl DerefMut for Builder {
+    fn deref_mut(&mut self) -> &mut Vec<Build> { &mut self.0 }
+}
+
 #[cfg(test)]
 mod tests {
-    use Expr;
+    use { Expr, Repeater, Error, ErrorKind };
     use super::Parser;
 
     fn p(s: &str) -> Expr { Parser::parse(s).unwrap() }
+    fn perr(s: &str) -> Error { Parser::parse(s).unwrap_err() }
 
     #[test]
     fn empty() {
@@ -145,5 +188,72 @@ mod tests {
             Expr::StartText,
             Expr::Literal { c: 'a', casei: false },
         ]));
+    }
+
+    #[test]
+    fn repeat_zero_or_one_greedy() {
+        assert_eq!(p("a?"), Expr::Repeat {
+            e: Box::new(Expr::Literal { c: 'a', casei: false }),
+            r: Repeater::ZeroOrOne,
+            greedy: true,
+        });
+    }
+
+    #[test]
+    fn repeat_zero_or_one_nongreedy() {
+        assert_eq!(p("a??"), Expr::Repeat {
+            e: Box::new(Expr::Literal { c: 'a', casei: false }),
+            r: Repeater::ZeroOrOne,
+            greedy: false,
+        });
+    }
+
+    #[test]
+    fn repeat_one_or_more_greedy() {
+        assert_eq!(p("a+"), Expr::Repeat {
+            e: Box::new(Expr::Literal { c: 'a', casei: false }),
+            r: Repeater::OneOrMore,
+            greedy: true,
+        });
+    }
+
+    #[test]
+    fn repeat_one_or_more_nongreedy() {
+        assert_eq!(p("a+?"), Expr::Repeat {
+            e: Box::new(Expr::Literal { c: 'a', casei: false }),
+            r: Repeater::OneOrMore,
+            greedy: false,
+        });
+    }
+
+    #[test]
+    fn repeat_zero_or_more_greedy() {
+        assert_eq!(p("a*"), Expr::Repeat {
+            e: Box::new(Expr::Literal { c: 'a', casei: false }),
+            r: Repeater::ZeroOrMore,
+            greedy: true,
+        });
+    }
+
+    #[test]
+    fn repeat_zero_or_more_nongreedy() {
+        assert_eq!(p("a*?"), Expr::Repeat {
+            e: Box::new(Expr::Literal { c: 'a', casei: false }),
+            r: Repeater::ZeroOrMore,
+            greedy: false,
+        });
+    }
+
+    #[test]
+    fn repeat_illegal_exprs() {
+        assert_eq!(perr("a**"), Error {
+            pos: 2,
+            surround: "a**".into(),
+            kind: ErrorKind::RepeaterUnexpectedExpr(Expr::Repeat {
+                e: Box::new(Expr::Literal { c: 'a', casei: false }),
+                r: Repeater::ZeroOrMore,
+                greedy: true,
+            }),
+        });
     }
 }
