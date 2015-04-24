@@ -33,7 +33,7 @@ struct Parser {
     chars: Vec<char>,
     chari: i32,
     stack: Builder,
-    caps: usize,
+    caps: u32,
 }
 
 impl Parser {
@@ -53,6 +53,10 @@ impl Parser {
         while !self.eof() {
             let c = self.cur();
             let build_expr = match c {
+                '(' => {
+                    self.caps += 1; // capture indices start at 1
+                    Build::LeftParen { i: Some(self.caps), name: None }
+                }
                 '?' => try!(self.parse_simple_repeat(Repeater::ZeroOrOne)),
                 '*' => try!(self.parse_simple_repeat(Repeater::ZeroOrMore)),
                 '+' => try!(self.parse_simple_repeat(Repeater::OneOrMore)),
@@ -171,6 +175,8 @@ mod tests {
 
     fn p(s: &str) -> Expr { Parser::parse(s).unwrap() }
     fn perr(s: &str) -> Error { Parser::parse(s).unwrap_err() }
+    fn lit(c: char) -> Expr { Expr::Literal { c: c, casei: false } }
+    fn b<T>(v: T) -> Box<T> { Box::new(v) }
 
     #[test]
     fn empty() {
@@ -179,7 +185,14 @@ mod tests {
 
     #[test]
     fn literal() {
-        assert_eq!(p("a"), Expr::Literal { c: 'a', casei: false });
+        assert_eq!(p("a"), lit('a'));
+    }
+
+    #[test]
+    fn literal_string() {
+        // TODO: This should be a literal string, but we need to implement
+        // "simplify" or something first.
+        assert_eq!(p("ab"), Expr::Concat(vec![lit('a'), lit('b')]));
     }
 
     #[test]
@@ -193,16 +206,28 @@ mod tests {
     #[test]
     fn repeat_zero_or_one_greedy() {
         assert_eq!(p("a?"), Expr::Repeat {
-            e: Box::new(Expr::Literal { c: 'a', casei: false }),
+            e: b(lit('a')),
             r: Repeater::ZeroOrOne,
             greedy: true,
         });
     }
 
     #[test]
+    fn repeat_zero_or_one_greedy_concat() {
+        assert_eq!(p("ab?"), Expr::Concat(vec![
+            lit('a'),
+            Expr::Repeat {
+                e: b(lit('b')),
+                r: Repeater::ZeroOrOne,
+                greedy: true,
+            },
+        ]));
+    }
+
+    #[test]
     fn repeat_zero_or_one_nongreedy() {
         assert_eq!(p("a??"), Expr::Repeat {
-            e: Box::new(Expr::Literal { c: 'a', casei: false }),
+            e: b(lit('a')),
             r: Repeater::ZeroOrOne,
             greedy: false,
         });
@@ -211,7 +236,7 @@ mod tests {
     #[test]
     fn repeat_one_or_more_greedy() {
         assert_eq!(p("a+"), Expr::Repeat {
-            e: Box::new(Expr::Literal { c: 'a', casei: false }),
+            e: b(lit('a')),
             r: Repeater::OneOrMore,
             greedy: true,
         });
@@ -220,7 +245,7 @@ mod tests {
     #[test]
     fn repeat_one_or_more_nongreedy() {
         assert_eq!(p("a+?"), Expr::Repeat {
-            e: Box::new(Expr::Literal { c: 'a', casei: false }),
+            e: b(lit('a')),
             r: Repeater::OneOrMore,
             greedy: false,
         });
@@ -229,7 +254,7 @@ mod tests {
     #[test]
     fn repeat_zero_or_more_greedy() {
         assert_eq!(p("a*"), Expr::Repeat {
-            e: Box::new(Expr::Literal { c: 'a', casei: false }),
+            e: b(lit('a')),
             r: Repeater::ZeroOrMore,
             greedy: true,
         });
@@ -238,7 +263,7 @@ mod tests {
     #[test]
     fn repeat_zero_or_more_nongreedy() {
         assert_eq!(p("a*?"), Expr::Repeat {
-            e: Box::new(Expr::Literal { c: 'a', casei: false }),
+            e: b(lit('a')),
             r: Repeater::ZeroOrMore,
             greedy: false,
         });
@@ -250,10 +275,19 @@ mod tests {
             pos: 2,
             surround: "a**".into(),
             kind: ErrorKind::RepeaterUnexpectedExpr(Expr::Repeat {
-                e: Box::new(Expr::Literal { c: 'a', casei: false }),
+                e: b(lit('a')),
                 r: Repeater::ZeroOrMore,
                 greedy: true,
             }),
         });
     }
+
+    // #[test]
+    // fn group_literal() {
+        // assert_eq!(p("(a)"), Expr::Group {
+            // e: b(lit('a')),
+            // i: Some(1),
+            // name: None,
+        // });
+    // }
 }

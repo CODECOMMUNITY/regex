@@ -57,9 +57,88 @@ impl Expr {
             | Class { .. }
             | Group { .. }
             => true,
+            Concat(ref es) if es.len() > 0 => es[es.len()-1].can_repeat(),
+            Alternate(ref es) if es.len() > 0 => es[es.len()-1].can_repeat(),
             _ => false,
         }
     }
+
+    pub fn concat(self, new: Expr) -> Expr {
+        fn concat(e1: Expr, e2: Expr) -> Expr {
+            match (e1, e2) {
+                (Concat(mut es1), Concat(es2)) => {
+                    es1.extend(es2);
+                    Concat(es1)
+                }
+                (Concat(mut es1), e2) => { es1.push(e2); Concat(es1) }
+                (e1, Concat(mut es2)) => { es2.insert(0, e1); Concat(es2) }
+                (e1, e2) => Concat(vec![e1, e2]),
+            }
+        }
+        match (self, new) {
+            (Empty, e) | (e, Empty) => e,
+            (old @ Literal{..}, e) => concat(old, e),
+            (old @ LiteralString{..}, e) => concat(old, e),
+            (AnyChar, e) => concat(AnyChar, e),
+            (AnyCharNoNL, e) => concat(AnyCharNoNL, e),
+            (old @ Class{..}, e) => concat(old, e),
+            (StartLine, e) => concat(StartLine, e),
+            (EndLine, e) => concat(EndLine, e),
+            (StartText, e) => concat(StartText, e),
+            (EndText, e) => concat(EndText, e),
+            (WordBoundary, e) => concat(WordBoundary, e),
+            (NotWordBoundary, e) => concat(NotWordBoundary, e),
+            (old @ Group{..}, e) => concat(old, e),
+            (old @ Repeat{..}, e) => concat(old, e),
+            (old @ Concat(_), e) => concat(old, e),
+            (Alternate(mut es), e) => {
+                let last = es.pop().expect("at least one alternate");
+                es.push(last.concat(e));
+                Alternate(es)
+            }
+        }
+    }
+
+    // Literal simplification pieces. ---AG
+    /*(Literal { c: oc, casei: ocasei },
+     Literal { c: nc, casei: ncasei }) => {
+        if ocasei == ncasei {
+            LiteralString { s: vec![oc, nc], casei: ocasei }
+        } else {
+            Concat(vec![Literal { c: oc, casei: ocasei },
+                        Literal { c: nc, casei: ncasei }])
+        }
+    }
+    (LiteralString { s: mut os, casei: ocasei },
+     LiteralString { s: ns, casei: ncasei }) => {
+        if ocasei == ncasei {
+            os.extend(ns);
+            LiteralString { s: os, casei: ocasei }
+        } else {
+            concat(LiteralString { s: os, casei: ocasei },
+                   LiteralString { s: ns, casei: ncasei })
+        }
+    }
+    (LiteralString { s: mut os, casei: ocasei },
+     Literal { c: nc, casei: ncasei }) => {
+        if ocasei == ncasei {
+            os.push(nc);
+            LiteralString { s: os, casei: ocasei }
+        } else {
+            concat(LiteralString { s: os, casei: ocasei },
+                   Literal { c: nc, casei: ncasei })
+        }
+    }
+    (Literal { c: oc, casei: ocasei },
+     LiteralString { s: mut ns, casei: ncasei }) => {
+        if ocasei == ncasei {
+            ns.insert(0, oc);
+            LiteralString { s: ns, casei: ocasei }
+        } else {
+            concat(Literal { c: oc, casei: ocasei },
+                   LiteralString { s: ns, casei: ncasei })
+        }
+    }*/
 }
 
 impl Deref for CharClass {
