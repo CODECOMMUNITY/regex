@@ -57,8 +57,6 @@ impl Expr {
             | Class { .. }
             | Group { .. }
             => true,
-            Concat(ref es) if es.len() > 0 => es[es.len()-1].can_repeat(),
-            Alternate(ref es) if es.len() > 0 => es[es.len()-1].can_repeat(),
             _ => false,
         }
     }
