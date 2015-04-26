@@ -1,32 +1,23 @@
 use std::cmp::{max, min};
 use std::ops::{Deref, DerefMut};
 use std::result;
-use {Expr, Repeater, CharClass, ClassRange, CaptureIndex, CaptureName};
 
-pub type Result<T> = ::std::result::Result<T, Error>;
+use unicode::case_folding;
+use unicode::regex::UNICODE_CLASSES;
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Error {
-    pub pos: i32,
-    pub surround: String,
-    pub kind: ErrorKind,
-}
+use {
+    Expr, Repeater, CharClass, ClassRange, CaptureIndex, CaptureName,
+    Error, ErrorKind, Result,
+    simple_case_fold,
+};
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum ErrorKind {
-    DoubleFlagNegation,
-    EmptyAlternate,
-    EmptyCaptureName,
-    EmptyFlagNegation,
-    EmptyGroup,
-    InvalidCaptureName(String),
-    RepeaterExpectsExpr,
-    RepeaterUnexpectedExpr(Expr),
-    UnclosedCaptureName(String),
-    UnclosedParen,
-    UnexpectedFlagEof,
-    UnopenedParen,
-    UnrecognizedFlag(char),
+#[derive(Debug)]
+struct Parser {
+    chars: Vec<char>,
+    chari: i32,
+    stack: Vec<Build>,
+    caps: u32,
+    flags: Flags,
 }
 
 #[derive(Debug)]
@@ -40,15 +31,6 @@ enum Build {
     },
 }
 
-#[derive(Debug)]
-struct Parser {
-    chars: Vec<char>,
-    chari: i32,
-    stack: Vec<Build>,
-    caps: u32,
-    flags: Flags,
-}
-
 #[derive(Clone, Copy, Debug)]
 struct Flags {
     casei: bool,
@@ -57,6 +39,7 @@ struct Flags {
     swap_greed: bool,
 }
 
+// Primary expression parsing routines.
 impl Parser {
     fn parse(s: &str) -> Result<Expr> {
         Parser {
@@ -73,14 +56,20 @@ impl Parser {
         }.parse_expr()
     }
 
+    // Top-level expression parser.
+    //
+    // Starts at the beginning of the input and consumes until either the end
+    // of input or an error.
     fn parse_expr(mut self) -> Result<Expr> {
         while !self.eof() {
             let c = self.cur();
             let build_expr = match c {
+                '\\' => try!(self.parse_escape()),
                 '|' => { let e = try!(self.alternate()); self.bump(); e }
                 '?' => try!(self.parse_simple_repeat(Repeater::ZeroOrOne)),
                 '*' => try!(self.parse_simple_repeat(Repeater::ZeroOrMore)),
                 '+' => try!(self.parse_simple_repeat(Repeater::OneOrMore)),
+                '{' => try!(self.parse_counted_repeat()),
                 '^' => {
                     if self.flags.multi {
                         self.parse_one(Expr::StartLine)
@@ -119,6 +108,47 @@ impl Parser {
             }
         }
         self.finish_concat()
+    }
+
+    // Parses an escape sequence, e.g., \Ax
+    //
+    // Start: `\`
+    // End:   `x`
+    fn parse_escape(&mut self) -> Result<Build> {
+        self.bump();
+        if self.eof() {
+            return Err(self.err(ErrorKind::UnexpectedEscapeEof));
+        }
+        let c = self.cur();
+        if is_punct(c) {
+            return Ok(Build::Expr(Expr::Literal {
+                c: self.bump(),
+                casei: self.flags.casei,
+            }));
+        }
+
+        fn lit(c: char) -> Build {
+            Build::Expr(Expr::Literal { c: c, casei: false })
+        }
+        match c {
+            'a' => { self.bump(); Ok(lit('\x07')) }
+            'f' => { self.bump(); Ok(lit('\x0C')) }
+            't' => { self.bump(); Ok(lit('\t')) }
+            'n' => { self.bump(); Ok(lit('\n')) }
+            'r' => { self.bump(); Ok(lit('\r')) }
+            'v' => { self.bump(); Ok(lit('\x0B')) }
+            'A' => { self.bump(); Ok(Build::Expr(Expr::StartText)) }
+            'z' => { self.bump(); Ok(Build::Expr(Expr::EndText)) }
+            'b' => { self.bump(); Ok(Build::Expr(Expr::WordBoundary)) }
+            'B' => { self.bump(); Ok(Build::Expr(Expr::NotWordBoundary)) }
+            '0'|'1'|'2'|'3'|'4'|'5'|'6'|'7' => self.parse_octal(),
+            'x' => { self.bump(); self.parse_hex() }
+            'p' => { self.bump(); self.parse_unicode_name(false) }
+            'P' => { self.bump(); self.parse_unicode_name(true) }
+            'd'|'s'|'w' => { self.bump(); self.parse_perl_class(c, false) }
+            'D'|'S'|'W' => { self.bump(); self.parse_perl_class(c, true) }
+            c => Err(self.err(ErrorKind::UnrecognizedEscape(c))),
+        }
     }
 
     // Parses a group, e.g., `(abc)`.
@@ -236,7 +266,7 @@ impl Parser {
             // e.g., (?P<a
             return Err(self.err(ErrorKind::UnclosedCaptureName(name)));
         }
-        let all_valid = name.chars().all(is_valid_cap);
+        let all_valid = name.chars().all(is_valid_capture_char);
         match name.chars().next() {
             // e.g., (?P<>a)
             None => Err(self.err(ErrorKind::EmptyCaptureName)),
@@ -249,6 +279,45 @@ impl Parser {
                 self.bump(); // for `>`
                 Ok(name)
             }
+        }
+    }
+
+    // Parses a counted repeition operator, e.g., `a{2,4}?z`.
+    //
+    // Start: `{`
+    // End:   `z`
+    fn parse_counted_repeat(&mut self) -> Result<Build> {
+        let e = try!(self.pop(ErrorKind::RepeaterExpectsExpr)); // e.g., ({5}
+        if !e.can_repeat() {
+            // e.g., a*{5}
+            return Err(self.err(ErrorKind::RepeaterUnexpectedExpr(e)));
+        }
+        self.bump();
+        let min = try!(self.parse_decimal(|c| c != ',' && c != '}'));
+        let mut max_opt = Some(min);
+        if self.bump_if(',') {
+            if self.peek_is('}') {
+                max_opt = None;
+            } else {
+                let max = try!(self.parse_decimal(|c| c != '}'));
+                if min > max {
+                    // e.g., a{2,1}
+                    return Err(self.err(ErrorKind::InvalidRepeatRange {
+                        min: min,
+                        max: max,
+                    }));
+                }
+                max_opt = Some(max);
+            }
+        }
+        if !self.bump_if('}') {
+            Err(self.err(ErrorKind::UnclosedRepeat))
+        } else {
+            Ok(Build::Expr(Expr::Repeat {
+                e: Box::new(e),
+                r: Repeater::Range { min: min, max: max_opt },
+                greedy: !self.bump_if('?') ^ self.flags.swap_greed,
+            }))
         }
     }
 
@@ -273,6 +342,117 @@ impl Parser {
         }))
     }
 
+    // Parses a decimal number until the given character, e.g., `a{123,456}`.
+    //
+    // Start: `1`
+    // End:   `,` (where `until == ','`)
+    fn parse_decimal<B: Bumpable>(&mut self, until: B) -> Result<u32> {
+        match self.bump_get(until) {
+            // e.g., a{}
+            None => Err(self.err(ErrorKind::MissingBase10)),
+            Some(n) => {
+                // e.g., a{xyz
+                // e.g., a{9999999999}
+                u32::from_str_radix(&n, 10)
+                    .map_err(|_| self.err(ErrorKind::InvalidBase10(n)))
+            }
+        }
+    }
+
+    // Parses an octal number, up to 3 digits, e.g., `a\123b`
+    //
+    // Start: `1`
+    // End:   `b`
+    fn parse_octal(&mut self) -> Result<Build> {
+        use std::char;
+        let mut i = 0; // counter for limiting octal to 3 digits.
+        let n = self.bump_get(|c| { i += 1; i <= 3 && c >= '0' && c <= '7' })
+                    .expect("octal string"); // guaranteed at least 1 digit
+        // I think both of the following unwraps are impossible to fail.
+        // We limit it to a three digit octal number, which maxes out at
+        // `0777` or `511` in decimal. Since all digits are in `0...7`, we'll
+        // always have a valid `u32` number. Moreover, since all numbers in
+        // the range `0...511` are valid Unicode scalar values, it will always
+        // be a valid `char`.
+        //
+        // Hence, we `unwrap` with reckless abandon.
+        let n = u32::from_str_radix(&n, 8).ok().expect("valid octal number");
+        Ok(Build::Expr(Expr::Literal {
+            c: char::from_u32(n).expect("Unicode scalar value"),
+            casei: self.flags.casei,
+        }))
+    }
+
+    // Parses a hex number, e.g., `a\x5ab`.
+    //
+    // Start: `5`
+    // End:   `b`
+    //
+    // And also, `a\x{2603}b`.
+    //
+    // Start: `{`
+    // End:   `b`
+    fn parse_hex(&mut self) -> Result<Build> {
+        if self.bump_if('{') {
+            self.parse_hex_many_digits()
+        } else {
+            self.parse_hex_two_digits()
+        }
+    }
+
+    // Parses a many-digit hex number, e.g., `a\x{2603}b`.
+    //
+    // Start: `2`
+    // End:   `b`
+    fn parse_hex_many_digits(&mut self) -> Result<Build> {
+        use std::char;
+
+        let s = self.bump_get(|c| c != '}').unwrap_or("".into());
+        let n = try!(u32::from_str_radix(&s, 16)
+                         .map_err(|_| self.err(ErrorKind::InvalidBase16(s))));
+        let c = try!(char::from_u32(n)
+                          .ok_or(self.err(ErrorKind::InvalidScalarValue(n))));
+        if !self.bump_if('}') {
+            // e.g., a\x{d
+            return Err(self.err(ErrorKind::UnclosedHex));
+        }
+        Ok(Build::Expr(Expr::Literal {
+            c: c,
+            casei: self.flags.casei,
+        }))
+    }
+
+    // Parses a two-digit hex number, e.g., `a\x5ab`.
+    //
+    // Start: `5`
+    // End:   `b`
+    fn parse_hex_two_digits(&mut self) -> Result<Build> {
+        use std::char;
+
+        let mut i = 0;
+        let s = self.bump_get(|c| { i += 1; i <= 2 }).unwrap_or("".into());
+        if s.len() < 2 {
+            // e.g., a\x
+            // e.g., a\xf
+            return Err(self.err(ErrorKind::UnexpectedTwoDigitHexEof));
+        }
+        let n = try!(u32::from_str_radix(&s, 16)
+                         .map_err(|_| self.err(ErrorKind::InvalidBase16(s))));
+        Ok(Build::Expr(Expr::Literal {
+            // Because 0...255 are all valid Unicode scalar values.
+            c: char::from_u32(n).expect("Unicode scalar value"),
+            casei: self.flags.casei,
+        }))
+    }
+
+    fn parse_unicode_name(&mut self, negate: bool) -> Result<Build> {
+        Ok(Build::Expr(Expr::Empty))
+    }
+
+    fn parse_perl_class(&mut self, name: char, negate: bool) -> Result<Build> {
+        Ok(Build::Expr(Expr::Empty))
+    }
+
     // Always bump to the next input and return the given expression as a
     // `Build`.
     //
@@ -290,17 +470,30 @@ impl Parser {
     fn cur(&self) -> char { self.chars[self.chari as usize] }
     fn eof(&self) -> bool { self.chari as usize >= self.chars.len() }
 
-    fn bump_if<B: Bumpable + Copy>(&mut self, s: B) -> bool {
-        if self.peek_is(s) {
-            self.chari += s.char_len() as i32;
-            true
+    fn bump_get<B: Bumpable>(&mut self, s: B) -> Option<String> {
+        let n = s.match_end(self);
+        if n == 0 {
+            None
         } else {
-            false
+            let s = self.chars[self.chari as usize..self.chari as usize + n]
+                        .iter().cloned().collect::<String>();
+            self.chari += n as i32;
+            Some(s)
         }
     }
 
-    fn peek_is<B: Bumpable + Copy>(&self, s: B) -> bool {
-        s.peek_is(self)
+    fn bump_if<B: Bumpable>(&mut self, s: B) -> bool {
+        let n = s.match_end(self);
+        if n == 0 {
+            false
+        } else {
+            self.chari += n as i32;
+            true
+        }
+    }
+
+    fn peek_is<B: Bumpable>(&self, s: B) -> bool {
+        s.match_end(self) > 0
     }
 
     fn err(&self, kind: ErrorKind) -> Error {
@@ -488,34 +681,46 @@ impl Build {
 // Make it ergonomic to conditionally bump the parser.
 // i.e., `bump_if('a')` or `bump_if("abc")`.
 trait Bumpable {
-    fn peek_is(&self, p: &Parser) -> bool;
-    fn char_len(&self) -> usize;
-}
-
-impl<'a, T: ?Sized + Bumpable> Bumpable for &'a T {
-    fn peek_is(&self, p: &Parser) -> bool { (**self).peek_is(p) }
-    fn char_len(&self) -> usize { (**self).char_len() }
+    fn match_end(self, p: &Parser) -> usize;
 }
 
 impl Bumpable for char {
-    fn peek_is(&self, p: &Parser) -> bool {
-        if p.eof() { false } else { p.cur() == *self }
+    fn match_end(self, p: &Parser) -> usize {
+        if !p.eof() && p.cur() == self { 1 } else { 0 }
     }
-    fn char_len(&self) -> usize { 1 }
 }
 
-impl Bumpable for str {
-    fn peek_is(&self, p: &Parser) -> bool {
-        let rest = &p.chars[p.chari as usize..];
-        if rest.len() < self.char_len() {
-            false
-        } else {
-            self.chars().zip(rest).all(|(c1, &c2)| c1 == c2)
+impl<'a> Bumpable for &'a str {
+    fn match_end(self, p: &Parser) -> usize {
+        let mut search = self.chars();
+        let mut rest = p.chars[p.chari as usize..].iter().cloned();
+        let mut count = 0;
+        loop {
+            match (rest.next(), search.next()) {
+                (Some(c1), Some(c2)) if c1 == c2 => count += 1,
+                (_, None) => return count,
+                _ => return 0,
+            }
         }
     }
-    fn char_len(&self) -> usize { self.chars().count() }
 }
 
+impl<F: FnMut(char) -> bool> Bumpable for F {
+    fn match_end(mut self, p: &Parser) -> usize {
+        let mut count = 0;
+        for c in p.chars[p.chari as usize..].iter().cloned() {
+            if self(c) {
+                count += 1;
+            } else {
+                break;
+            }
+        }
+        count
+    }
+}
+
+// Turn a sequence of expressions into a concatenation.
+// This only uses `Concat` if there are 2 or more expressions.
 fn rev_concat(mut exprs: Vec<Expr>) -> Expr {
     if exprs.len() == 0 {
         Expr::Empty
@@ -527,9 +732,34 @@ fn rev_concat(mut exprs: Vec<Expr>) -> Expr {
     }
 }
 
-fn is_valid_cap(c: char) -> bool {
+// Returns ture iff the given character is allowed in a capture name.
+// Note that the first char of a capture name must not be numeric.
+fn is_valid_capture_char(c: char) -> bool {
     c == '_' || (c >= '0' && c <= '9')
     || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')
+}
+
+// Returns true iff the give character has significance in a regex.
+pub fn is_punct(c: char) -> bool {
+    match c {
+        '\\' | '.' | '+' | '*' | '?' | '(' | ')' | '|' |
+        '[' | ']' | '{' | '}' | '^' | '$' => true,
+        _ => false,
+    }
+}
+
+fn is_hex(c: char) -> bool {
+    match c {
+        '0'...'9' | 'a'...'f' | 'A'...'F' => true,
+        _ => false
+    }
+}
+
+fn unicode_class(name: &str) -> Option<CharClass> {
+    UNICODE_CLASSES.binary_search_by(|&(s, _)| s.cmp(name)).ok().map(|i| {
+        let range = |&(s, e)| ClassRange { start: s, end: e };
+        CharClass(UNICODE_CLASSES[i].1.iter().map(range).collect())
+    })
 }
 
 #[cfg(test)]
@@ -631,6 +861,60 @@ mod tests {
         assert_eq!(p("a*?"), Expr::Repeat {
             e: b(lit('a')),
             r: Repeater::ZeroOrMore,
+            greedy: false,
+        });
+    }
+
+    #[test]
+    fn repeat_counted_exact() {
+        assert_eq!(p("a{5}"), Expr::Repeat {
+            e: b(lit('a')),
+            r: Repeater::Range { min: 5, max: Some(5) },
+            greedy: true,
+        });
+    }
+
+    #[test]
+    fn repeat_counted_min() {
+        assert_eq!(p("a{5,}"), Expr::Repeat {
+            e: b(lit('a')),
+            r: Repeater::Range { min: 5, max: None },
+            greedy: true,
+        });
+    }
+
+    #[test]
+    fn repeat_counted_min_max() {
+        assert_eq!(p("a{5,10}"), Expr::Repeat {
+            e: b(lit('a')),
+            r: Repeater::Range { min: 5, max: Some(10) },
+            greedy: true,
+        });
+    }
+
+    #[test]
+    fn repeat_counted_exact_nongreedy() {
+        assert_eq!(p("a{5}?"), Expr::Repeat {
+            e: b(lit('a')),
+            r: Repeater::Range { min: 5, max: Some(5) },
+            greedy: false,
+        });
+    }
+
+    #[test]
+    fn repeat_counted_min_nongreedy() {
+        assert_eq!(p("a{5,}?"), Expr::Repeat {
+            e: b(lit('a')),
+            r: Repeater::Range { min: 5, max: None },
+            greedy: false,
+        });
+    }
+
+    #[test]
+    fn repeat_counted_min_max_nongreedy() {
+        assert_eq!(p("a{5,10}?"), Expr::Repeat {
+            e: b(lit('a')),
+            r: Repeater::Range { min: 5, max: Some(10) },
             greedy: false,
         });
     }
@@ -856,12 +1140,56 @@ mod tests {
         ]));
     }
 
+    #[test]
+    fn escape_simple() {
+        assert_eq!(p(r"\a\f\t\n\r\v"), c(&[
+            lit('\x07'), lit('\x0C'), lit('\t'),
+            lit('\n'), lit('\r'), lit('\x0B'),
+        ]));
+    }
+
+    #[test]
+    fn escape_boundaries() {
+        assert_eq!(p(r"\A\z\b\B"), c(&[
+            Expr::StartText, Expr::EndText,
+            Expr::WordBoundary, Expr::NotWordBoundary,
+        ]));
+    }
+
+    #[test]
+    fn escape_punctuation() {
+        assert_eq!(p(r"\\\.\+\*\?\(\)\|\[\]\{\}\^\$"), c(&[
+            lit('\\'), lit('.'), lit('+'), lit('*'), lit('?'),
+            lit('('), lit(')'), lit('|'), lit('['), lit(']'),
+            lit('{'), lit('}'), lit('^'), lit('$'),
+        ]));
+    }
+
+    #[test]
+    fn escape_octal() {
+        assert_eq!(p(r"\123"), lit('S'));
+        assert_eq!(p(r"\1234"), c(&[lit('S'), lit('4')]));
+    }
+
+    #[test]
+    fn escape_hex2() {
+        assert_eq!(p(r"\x53"), lit('S'));
+        assert_eq!(p(r"\x534"), c(&[lit('S'), lit('4')]));
+    }
+
+    #[test]
+    fn escape_hex() {
+        assert_eq!(p(r"\x{53}"), lit('S'));
+        assert_eq!(p(r"\x{53}4"), c(&[lit('S'), lit('4')]));
+        assert_eq!(p(r"\x{2603}"), lit('\u{2603}'));
+    }
+
     /******************************************************/
     // Test every single possible error case.
     /******************************************************/
 
     #[test]
-    fn error_repeat_no_expr() {
+    fn error_repeat_no_expr_simple() {
         assert_eq!(perr("(*"), Error {
             pos: 1,
             surround: "(*".into(),
@@ -870,7 +1198,16 @@ mod tests {
     }
 
     #[test]
-    fn error_repeat_illegal_exprs() {
+    fn error_repeat_no_expr_counted() {
+        assert_eq!(perr("({5}"), Error {
+            pos: 1,
+            surround: "({5}".into(),
+            kind: ErrorKind::RepeaterExpectsExpr,
+        });
+    }
+
+    #[test]
+    fn error_repeat_illegal_exprs_simple() {
         assert_eq!(perr("a**"), Error {
             pos: 2,
             surround: "a**".into(),
@@ -886,6 +1223,95 @@ mod tests {
             kind: ErrorKind::RepeaterUnexpectedExpr(Expr::Alternate(vec![
                 lit('a'),
             ])),
+        });
+    }
+
+    #[test]
+    fn error_repeat_illegal_exprs_counted() {
+        assert_eq!(perr("a*{5}"), Error {
+            pos: 2,
+            surround: "a*{5}".into(),
+            kind: ErrorKind::RepeaterUnexpectedExpr(Expr::Repeat {
+                e: b(lit('a')),
+                r: Repeater::ZeroOrMore,
+                greedy: true,
+            }),
+        });
+        assert_eq!(perr("a|{5}"), Error {
+            pos: 2,
+            surround: "a|{5}".into(),
+            kind: ErrorKind::RepeaterUnexpectedExpr(Expr::Alternate(vec![
+                lit('a'),
+            ])),
+        });
+    }
+
+    #[test]
+    fn error_repeat_empty_number() {
+        assert_eq!(perr("a{}"), Error {
+            pos: 2,
+            surround: "a{}".into(),
+            kind: ErrorKind::MissingBase10,
+        });
+    }
+
+    #[test]
+    fn error_repeat_eof() {
+        assert_eq!(perr("a{5"), Error {
+            pos: 3,
+            surround: "a{5".into(),
+            kind: ErrorKind::UnclosedRepeat,
+        });
+    }
+
+    #[test]
+    fn error_repeat_empty_number_eof() {
+        assert_eq!(perr("a{xyz"), Error {
+            pos: 5,
+            surround: "a{xyz".into(),
+            kind: ErrorKind::InvalidBase10("xyz".into()),
+        });
+        assert_eq!(perr("a{12,xyz"), Error {
+            pos: 8,
+            surround: "2,xyz".into(),
+            kind: ErrorKind::InvalidBase10("xyz".into()),
+        });
+    }
+
+    #[test]
+    fn error_repeat_invalid_number() {
+        assert_eq!(perr("a{9999999999}"), Error {
+            pos: 12,
+            surround: "99999}".into(),
+            kind: ErrorKind::InvalidBase10("9999999999".into()),
+        });
+        assert_eq!(perr("a{1,9999999999}"), Error {
+            pos: 14,
+            surround: "99999}".into(),
+            kind: ErrorKind::InvalidBase10("9999999999".into()),
+        });
+    }
+
+    #[test]
+    fn error_repeat_invalid_number_extra() {
+        assert_eq!(perr("a{12x}"), Error {
+            pos: 5,
+            surround: "a{12x}".into(),
+            kind: ErrorKind::InvalidBase10("12x".into()),
+        });
+        assert_eq!(perr("a{1,12x}"), Error {
+            pos: 7,
+            surround: "1,12x}".into(),
+            kind: ErrorKind::InvalidBase10("12x".into()),
+        });
+    }
+
+    #[test]
+    fn error_repeat_invalid_range() {
+        assert_eq!(perr("a{2,1}"), Error {
+            pos: 5,
+            surround: "a{2,1}".into(),
+            kind: ErrorKind::InvalidRepeatRange { min: 2, max: 1 },
         });
     }
 
@@ -1066,6 +1492,105 @@ mod tests {
             pos: 2,
             surround: "(?)".into(),
             kind: ErrorKind::EmptyFlagNegation,
+        });
+    }
+
+    #[test]
+    fn error_escape_unexpected_eof() {
+        assert_eq!(perr(r"\"), Error {
+            pos: 1,
+            surround: r"\".into(),
+            kind: ErrorKind::UnexpectedEscapeEof,
+        });
+    }
+
+    #[test]
+    fn error_escape_unrecognized() {
+        assert_eq!(perr(r"\m"), Error {
+            pos: 1,
+            surround: r"\m".into(),
+            kind: ErrorKind::UnrecognizedEscape('m'),
+        });
+    }
+
+    #[test]
+    fn error_escape_hex2_eof0() {
+        assert_eq!(perr(r"\x"), Error {
+            pos: 2,
+            surround: r"\x".into(),
+            kind: ErrorKind::UnexpectedTwoDigitHexEof,
+        });
+    }
+
+    #[test]
+    fn error_escape_hex2_eof1() {
+        assert_eq!(perr(r"\xA"), Error {
+            pos: 3,
+            surround: r"\xA".into(),
+            kind: ErrorKind::UnexpectedTwoDigitHexEof,
+        });
+    }
+
+    #[test]
+    fn error_escape_hex2_invalid() {
+        assert_eq!(perr(r"\xAG"), Error {
+            pos: 4,
+            surround: r"\xAG".into(),
+            kind: ErrorKind::InvalidBase16("AG".into()),
+        });
+    }
+
+    #[test]
+    fn error_escape_hex_eof0() {
+        assert_eq!(perr(r"\x{"), Error {
+            pos: 3,
+            surround: r"\x{".into(),
+            kind: ErrorKind::InvalidBase16("".into()),
+        });
+    }
+
+    #[test]
+    fn error_escape_hex_eof1() {
+        assert_eq!(perr(r"\x{A"), Error {
+            pos: 4,
+            surround: r"\x{A".into(),
+            kind: ErrorKind::UnclosedHex,
+        });
+    }
+
+    #[test]
+    fn error_escape_hex_invalid() {
+        assert_eq!(perr(r"\x{AG}"), Error {
+            pos: 5,
+            surround: r"\x{AG}".into(),
+            kind: ErrorKind::InvalidBase16("AG".into()),
+        });
+    }
+
+    #[test]
+    fn error_escape_hex_invalid_scalar_value_surrogate() {
+        assert_eq!(perr(r"\x{D800}"), Error {
+            pos: 7,
+            surround: r"{D800}".into(),
+            kind: ErrorKind::InvalidScalarValue(0xD800),
+        });
+    }
+
+    #[test]
+    fn error_escape_hex_invalid_scalar_value_high() {
+        assert_eq!(perr(r"\x{110000}"), Error {
+            pos: 9,
+            surround: r"10000}".into(),
+            kind: ErrorKind::InvalidScalarValue(0x110000),
+        });
+    }
+
+    #[test]
+    fn error_escape_hex_invalid_u32() {
+        assert_eq!(perr(r"\x{9999999999}"), Error {
+            pos: 13,
+            surround: r"99999}".into(),
+            kind: ErrorKind::InvalidBase16("9999999999".into()),
         });
     }
 }
