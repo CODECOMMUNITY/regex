@@ -7,3 +7,6 @@ repository = "https://github.com/rust-lang/regex"
 documentation = "http://doc.rust-lang.org/regex"
 homepage = "https://github.com/rust-lang/regex"
 description = "A regular expression parser (RE2 only)."
+
+[dev-dependencies]
+quickcheck = "*"

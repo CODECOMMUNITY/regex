@@ -143,10 +143,16 @@ impl Parser {
             'B' => { self.bump(); Ok(Build::Expr(Expr::NotWordBoundary)) }
             '0'|'1'|'2'|'3'|'4'|'5'|'6'|'7' => self.parse_octal(),
             'x' => { self.bump(); self.parse_hex() }
-            'p' => { self.bump(); self.parse_unicode_name(false) }
-            'P' => { self.bump(); self.parse_unicode_name(true) }
-            'd'|'s'|'w' => { self.bump(); self.parse_perl_class(c, false) }
-            'D'|'S'|'W' => { self.bump(); self.parse_perl_class(c, true) }
+            'p'|'P' => {
+                self.bump();
+                self.parse_unicode_class(c == 'P')
+                    .map(|cls| Build::Expr(Expr::Class(cls)))
+            }
+            'd'|'s'|'w'|'D'|'S'|'W' => {
+                self.bump();
+                self.parse_perl_class(c, c == 'D' || c == 'S' || c == 'W')
+                    .map(|cls| Build::Expr(Expr::Class(cls)))
+            }
             c => Err(self.err(ErrorKind::UnrecognizedEscape(c))),
         }
     }
@@ -445,12 +451,23 @@ impl Parser {
         }))
     }
 
-    fn parse_unicode_name(&mut self, negate: bool) -> Result<Build> {
-        Ok(Build::Expr(Expr::Empty))
+    // Parses a Uncode class name, e.g., `a\pLb`.
+    //
+    // Start: `L`
+    // End:   `b`
+    //
+    // And also, `a\p{Greek}b`.
+    //
+    // Start: `{`
+    // End:   `b`
+    //
+    // `negate` is true when the class name is used with `\P`.
+    fn parse_unicode_class(&mut self, neg: bool) -> Result<CharClass> {
+        Ok(CharClass::new(vec![]))
     }
 
-    fn parse_perl_class(&mut self, name: char, negate: bool) -> Result<Build> {
-        Ok(Build::Expr(Expr::Empty))
+    fn parse_perl_class(&mut self, c: char, neg: bool) -> Result<CharClass> {
+        Ok(CharClass::new(vec![]))
     }
 
     // Always bump to the next input and return the given expression as a
@@ -758,7 +775,7 @@ fn is_hex(c: char) -> bool {
 fn unicode_class(name: &str) -> Option<CharClass> {
     UNICODE_CLASSES.binary_search_by(|&(s, _)| s.cmp(name)).ok().map(|i| {
         let range = |&(s, e)| ClassRange { start: s, end: e };
-        CharClass(UNICODE_CLASSES[i].1.iter().map(range).collect())
+        CharClass::new(UNICODE_CLASSES[i].1.iter().map(range).collect())
     })
 }
 

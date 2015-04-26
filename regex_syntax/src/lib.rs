@@ -10,12 +10,15 @@
 
 #![allow(dead_code, unused_imports, unused_variables)]
 
+#[cfg(test)] extern crate quickcheck;
+
 mod parser;
 mod unicode;
 
 use std::char;
 use std::cmp::{Ordering, max, min};
 use std::fmt;
+use std::iter::IntoIterator;
 use std::ops::{Deref, DerefMut};
 use std::slice;
 use std::vec;
@@ -32,7 +35,7 @@ pub enum Expr {
     LiteralString { s: Vec<char>, casei: bool },
     AnyChar,
     AnyCharNoNL,
-    Class { class: CharClass, casei: bool },
+    Class(CharClass),
     StartLine,
     EndLine,
     StartText,
@@ -61,7 +64,10 @@ pub enum Repeater {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct CharClass(pub Vec<ClassRange>);
+pub struct CharClass {
+    pub ranges: Vec<ClassRange>,
+    pub casei: bool,
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, PartialOrd, Eq, Ord)]
 pub struct ClassRange {
@@ -78,7 +84,7 @@ impl Expr {
             | LiteralString{..}
             | AnyChar
             | AnyCharNoNL
-            | Class{..}
+            | Class(_)
             | Group{..}
             => true,
             _ => false,
@@ -88,17 +94,17 @@ impl Expr {
 
 impl Deref for CharClass {
     type Target = Vec<ClassRange>;
-    fn deref(&self) -> &Vec<ClassRange> { &self.0 }
+    fn deref(&self) -> &Vec<ClassRange> { &self.ranges }
 }
 
 impl DerefMut for CharClass {
-    fn deref_mut(&mut self) -> &mut Vec<ClassRange> { &mut self.0 }
+    fn deref_mut(&mut self) -> &mut Vec<ClassRange> { &mut self.ranges }
 }
 
 impl IntoIterator for CharClass {
     type Item = ClassRange;
     type IntoIter = vec::IntoIter<ClassRange>;
-    fn into_iter(self) -> vec::IntoIter<ClassRange> { self.0.into_iter() }
+    fn into_iter(self) -> vec::IntoIter<ClassRange> { self.ranges.into_iter() }
 }
 
 impl<'a> IntoIterator for &'a CharClass {
@@ -114,16 +120,39 @@ impl<'a> IntoIterator for &'a mut CharClass {
 }
 
 impl CharClass {
+    fn new(ranges: Vec<ClassRange>) -> CharClass {
+        CharClass { ranges: ranges, casei: false }
+    }
+
+    fn new_casei(ranges: Vec<ClassRange>) -> CharClass {
+        CharClass { ranges: ranges, casei: true }
+    }
+
+    fn empty(&self) -> CharClass {
+        CharClass { ranges: Vec::with_capacity(self.len()), casei: self.casei }
+    }
+
+    fn merge(mut self, other: CharClass) -> CharClass {
+        self.extend(other);
+        self.canonicalize()
+    }
+
     fn canonicalize(mut self) -> CharClass {
+        // TODO: Save some cycles here by checking if already canonicalized.
         self.sort();
-        let mut ordered = CharClass(Vec::with_capacity(self.len()));
-        for ur in self {
-            match ordered.iter().position(|&or| ur.overlapping(or)) {
-                None => ordered.push(ur),
-                Some(i) => ordered[i] = ur.merge(ordered[i]),
+        let mut ordered = self.empty();
+        for candidate in self {
+            // If the candidate overlaps with an existing range, then it must
+            // be the most recent range added because we process the candidates
+            // in order.
+            if let Some(or) = ordered.last_mut() {
+                if or.overlapping(candidate) {
+                    *or = or.merge(candidate);
+                    continue;
+                }
             }
+            ordered.push(candidate);
         }
-        ordered.sort();
         ordered
     }
 
@@ -132,7 +161,7 @@ impl CharClass {
 
         if self.is_empty() { return self; }
         self = self.canonicalize();
-        let mut inv = CharClass(Vec::with_capacity(self.len()));
+        let mut inv = self.empty();
         if self[0].start > '\x00' {
             inv.push(range('\x00', dec_char(self[0].start)));
         }
@@ -146,7 +175,7 @@ impl CharClass {
     }
 
     fn case_fold(self) -> CharClass {
-        let mut folded = CharClass(Vec::with_capacity(self.len()));
+        let mut folded = self.empty();
         for r in self {
             if r.needs_case_folding() {
                 folded.extend(r.case_fold());
@@ -154,6 +183,7 @@ impl CharClass {
                 folded.push(r);
             }
         }
+        folded.casei = true;
         folded.canonicalize()
     }
 }
@@ -217,14 +247,6 @@ impl ClassRange {
 // TODO(burntsushi): Write tests for the regex writer.
 impl fmt::Display for Expr {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        fn quote_char(c: char) -> String {
-            let mut s = String::new();
-            if parser::is_punct(c) {
-                s.push('\\');
-            }
-            s.push(c);
-            s
-        }
         match *self {
             Empty => write!(f, ""),
             Literal { c, casei: false } => write!(f, "{}", quote_char(c)),
@@ -239,8 +261,7 @@ impl fmt::Display for Expr {
             }
             AnyChar => write!(f, "(?s:.)"),
             AnyCharNoNL => write!(f, "."),
-            Class { ref class, casei: false } => write!(f, "{}", class),
-            Class { ref class, casei: true } => write!(f, "(?i:{})", class),
+            Class(ref cls) => write!(f, "{}", cls),
             StartLine => write!(f, "(?m:^)"),
             EndLine => write!(f, "(?m:$)"),
             StartText => write!(f, r"^"),
@@ -286,17 +307,24 @@ impl fmt::Display for Repeater {
 
 impl fmt::Display for CharClass {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        if self.casei {
+            try!(write!(f, "(?i:"));
+        }
         try!(write!(f, "["));
         for range in self.iter() {
             try!(write!(f, "{}", range));
         }
-        write!(f, "]")
+        try!(write!(f, "]"));
+        if self.casei {
+            try!(write!(f, ")"));
+        }
+        Ok(())
     }
 }
 
 impl fmt::Display for ClassRange {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "{}-{}", self.start, self.end)
+        write!(f, "{}-{}", quote_char(self.start), quote_char(self.end))
     }
 }
 
@@ -365,6 +393,15 @@ pub fn quote(text: &str) -> String {
     quoted
 }
 
+fn quote_char(c: char) -> String {
+    let mut s = String::new();
+    if parser::is_punct(c) {
+        s.push('\\');
+    }
+    s.push(c);
+    s
+}
+
 fn inc_char(c: char) -> char {
     match c {
         char::MAX => char::MAX,
@@ -383,10 +420,27 @@ fn dec_char(c: char) -> char {
 
 #[cfg(test)]
 mod tests {
+    use quickcheck::{Arbitrary, Testable, quickcheck};
     use super::{CharClass, ClassRange};
 
     fn class(ranges: &[(char, char)]) -> CharClass {
-        CharClass(ranges.iter().map(|&(s, e)| ClassRange::new(s, e)).collect())
+        CharClass::new(ranges.iter().cloned().map(|(c1, c2)| {
+            if c1 <= c2 {
+                ClassRange::new(c1, c2)
+            } else {
+                ClassRange::new(c2, c1)
+            }
+        }).collect())
+    }
+
+    fn classi(ranges: &[(char, char)]) -> CharClass {
+        CharClass::new_casei(ranges.iter().cloned().map(|(c1, c2)| {
+            if c1 <= c2 {
+                ClassRange::new(c1, c2)
+            } else {
+                ClassRange::new(c2, c1)
+            }
+        }).collect())
     }
 
     #[test]
@@ -408,6 +462,28 @@ mod tests {
         let cls = class(&[('x', 'z'), ('w', 'y')]);
         assert_eq!(cls.canonicalize(), class(&[
             ('w', 'z'),
+        ]));
+    }
+
+    #[test]
+    fn class_canon_overlap_many() {
+        let cls = class(&[
+            ('c', 'f'), ('a', 'g'), ('d', 'j'), ('a', 'c'),
+            ('m', 'p'), ('l', 's'),
+        ]);
+        assert_eq!(cls.clone().canonicalize(), class(&[
+            ('a', 'j'), ('l', 's'),
+        ]));
+    }
+
+    #[test]
+    fn class_canon_overlap_many_case_fold() {
+        let cls = class(&[
+            ('C', 'F'), ('A', 'G'), ('D', 'J'), ('A', 'C'),
+            ('M', 'P'), ('L', 'S'), ('c', 'f'),
+        ]);
+        assert_eq!(cls.case_fold(), classi(&[
+            ('a', 'j'), ('l', 's'),
         ]));
     }
 
@@ -524,7 +600,7 @@ mod tests {
     #[test]
     fn class_fold_retain_only_needed() {
         let cls = class(&[('A', 'Z'), ('a', 'z')]);
-        assert_eq!(cls.case_fold(), class(&[
+        assert_eq!(cls.case_fold(), classi(&[
             ('a', 'z'),
         ]));
     }
@@ -532,7 +608,7 @@ mod tests {
     #[test]
     fn class_fold_az() {
         let cls = class(&[('A', 'Z')]);
-        assert_eq!(cls.case_fold(), class(&[
+        assert_eq!(cls.case_fold(), classi(&[
             ('a', 'z'),
         ]));
     }
@@ -543,7 +619,7 @@ mod tests {
         assert_eq!(cls.clone().canonicalize(), class(&[
             ('A', 'A'), ('_', '_'),
         ]));
-        assert_eq!(cls.case_fold(), class(&[
+        assert_eq!(cls.case_fold(), classi(&[
             ('_', '_'), ('a', 'a'),
         ]));
     }
@@ -554,7 +630,7 @@ mod tests {
         assert_eq!(cls.clone().canonicalize(), class(&[
             ('=', '='), ('A', 'A'),
         ]));
-        assert_eq!(cls.case_fold(), class(&[
+        assert_eq!(cls.case_fold(), classi(&[
             ('=', '='), ('a', 'a'),
         ]));
     }
@@ -562,8 +638,16 @@ mod tests {
     #[test]
     fn class_fold_no_folding_needed() {
         let cls = class(&[('\x00', '\x10')]);
-        assert_eq!(cls.case_fold(), class(&[
+        assert_eq!(cls.case_fold(), classi(&[
             ('\x00', '\x10'),
         ]));
+    }
+
+    #[test]
+    fn quickcheck_negate() {
+        fn prop(ranges: Vec<(char, char)>) -> bool {
+            class(&ranges).canonicalize() == class(&ranges).negate().negate()
+        }
+        quickcheck(prop as fn(Vec<(char, char)>) -> bool);
     }
 }
