@@ -356,12 +356,14 @@ pub enum ErrorKind {
     UnclosedHex,
     UnclosedParen,
     UnclosedRepeat,
+    UnclosedUnicodeName,
     UnexpectedEscapeEof,
     UnexpectedFlagEof,
     UnexpectedTwoDigitHexEof,
     UnopenedParen,
     UnrecognizedEscape(char),
     UnrecognizedFlag(char),
+    UnrecognizedUnicodeClass(String),
 }
 
 /// Returns the Unicode *simple* case folding of `c`.

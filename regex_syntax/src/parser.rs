@@ -64,7 +64,10 @@ impl Parser {
         while !self.eof() {
             let c = self.cur();
             let build_expr = match c {
-                '\\' => try!(self.parse_escape()),
+                '\\' => {
+                    let bexpr = try!(self.parse_escape());
+                    self.maybe_class_case_fold(bexpr)
+                }
                 '|' => { let e = try!(self.alternate()); self.bump(); e }
                 '?' => try!(self.parse_simple_repeat(Repeater::ZeroOrOne)),
                 '*' => try!(self.parse_simple_repeat(Repeater::ZeroOrMore)),
@@ -150,8 +153,7 @@ impl Parser {
             }
             'd'|'s'|'w'|'D'|'S'|'W' => {
                 self.bump();
-                self.parse_perl_class(c, c == 'D' || c == 'S' || c == 'W')
-                    .map(|cls| Build::Expr(Expr::Class(cls)))
+                Ok(Build::Expr(Expr::Class(self.parse_perl_class(c))))
             }
             c => Err(self.err(ErrorKind::UnrecognizedEscape(c))),
         }
@@ -463,11 +465,43 @@ impl Parser {
     //
     // `negate` is true when the class name is used with `\P`.
     fn parse_unicode_class(&mut self, neg: bool) -> Result<CharClass> {
-        Ok(CharClass::new(vec![]))
+        let name =
+            if self.bump_if('{') {
+                let n = self.bump_get(|c| c != '}').unwrap_or("".into());
+                if n.is_empty() || !self.bump_if('}') {
+                    // e.g., \p{Greek
+                    return Err(self.err(ErrorKind::UnclosedUnicodeName));
+                }
+                n
+            } else {
+                if self.eof() {
+                    // e.g., \p
+                    return Err(self.err(ErrorKind::UnexpectedEscapeEof));
+                }
+                self.bump().to_string()
+            };
+        match unicode_class(&name) {
+            None => Err(self.err(ErrorKind::UnrecognizedUnicodeClass(name))),
+            Some(cls) => if neg { Ok(cls.negate()) } else { Ok(cls) },
+        }
     }
 
-    fn parse_perl_class(&mut self, c: char, neg: bool) -> Result<CharClass> {
-        Ok(CharClass::new(vec![]))
+    // Parses a perl character class with Unicode support.
+    //
+    // `name` must be one of d, s, w, D, S, W. If not, this function panics.
+    //
+    // No parser state is changed.
+    fn parse_perl_class(&mut self, name: char) -> CharClass {
+        use unicode::regex::{PERLD, PERLS, PERLW};
+        match name {
+            'd' => raw_class_to_expr(PERLD),
+            'D' => raw_class_to_expr(PERLD).negate(),
+            's' => raw_class_to_expr(PERLS),
+            'S' => raw_class_to_expr(PERLS).negate(),
+            'w' => raw_class_to_expr(PERLW),
+            'W' => raw_class_to_expr(PERLW).negate(),
+            _ => unreachable!(),
+        }
     }
 
     // Always bump to the next input and return the given expression as a
@@ -530,6 +564,22 @@ impl Parser {
         match self.stack.pop() {
             None | Some(Build::LeftParen{..}) => Err(self.err(expected)),
             Some(Build::Expr(e)) => Ok(e),
+        }
+    }
+
+    // If the current contexts calls for case insensitivity and if the expr
+    // given is a character class, do case folding on it and return the new
+    // class.
+    //
+    // Otherwise, return the expression unchanged.
+    fn maybe_class_case_fold(&mut self, bexpr: Build) -> Build {
+        match bexpr {
+            Build::Expr(Expr::Class(cls)) => {
+                Build::Expr(Expr::Class(
+                    if self.flags.casei { cls.case_fold() } else { cls }
+                ))
+            }
+            bexpr => bexpr,
         }
     }
 }
@@ -774,14 +824,19 @@ fn is_hex(c: char) -> bool {
 
 fn unicode_class(name: &str) -> Option<CharClass> {
     UNICODE_CLASSES.binary_search_by(|&(s, _)| s.cmp(name)).ok().map(|i| {
-        let range = |&(s, e)| ClassRange { start: s, end: e };
-        CharClass::new(UNICODE_CLASSES[i].1.iter().map(range).collect())
+        raw_class_to_expr(UNICODE_CLASSES[i].1)
     })
+}
+
+fn raw_class_to_expr(raw: &[(char, char)]) -> CharClass {
+    let range = |&(s, e)| ClassRange { start: s, end: e };
+    CharClass::new(raw.iter().map(range).collect())
 }
 
 #[cfg(test)]
 mod tests {
-    use { Expr, Repeater, Error, ErrorKind };
+    use { CharClass, ClassRange, Expr, Repeater, Error, ErrorKind };
+    use unicode::regex::{PERLD, PERLS, PERLW};
     use super::Parser;
 
     fn p(s: &str) -> Expr { Parser::parse(s).unwrap() }
@@ -790,6 +845,26 @@ mod tests {
     fn liti(c: char) -> Expr { Expr::Literal { c: c, casei: true } }
     fn b<T>(v: T) -> Box<T> { Box::new(v) }
     fn c(es: &[Expr]) -> Expr { Expr::Concat(es.to_vec()) }
+
+    fn class(ranges: &[(char, char)]) -> CharClass {
+        CharClass::new(ranges.iter().cloned().map(|(c1, c2)| {
+            if c1 <= c2 {
+                ClassRange::new(c1, c2)
+            } else {
+                ClassRange::new(c2, c1)
+            }
+        }).collect())
+    }
+
+    fn classi(ranges: &[(char, char)]) -> CharClass {
+        CharClass::new_casei(ranges.iter().cloned().map(|(c1, c2)| {
+            if c1 <= c2 {
+                ClassRange::new(c1, c2)
+            } else {
+                ClassRange::new(c2, c1)
+            }
+        }).collect())
+    }
 
     #[test]
     fn empty() {
@@ -1201,6 +1276,137 @@ mod tests {
         assert_eq!(p(r"\x{2603}"), lit('\u{2603}'));
     }
 
+    #[test]
+    fn escape_unicode_name() {
+        assert_eq!(p(r"\p{Yi}"), Expr::Class(class(&[
+            ('\u{a000}', '\u{a48c}'), ('\u{a490}', '\u{a4c6}')
+        ])));
+    }
+
+    #[test]
+    fn escape_unicode_letter() {
+        assert_eq!(p(r"\pZ"), Expr::Class(class(&[
+            ('\u{20}', '\u{20}'), ('\u{a0}', '\u{a0}'),
+            ('\u{1680}', '\u{1680}'), ('\u{2000}', '\u{200a}'),
+            ('\u{2028}', '\u{2029}'), ('\u{202f}', '\u{202f}'),
+            ('\u{205f}', '\u{205f}'), ('\u{3000}', '\u{3000}'),
+        ])));
+    }
+
+    #[test]
+    fn escape_unicode_name_case_fold() {
+        assert_eq!(p(r"(?i)\p{Yi}"), Expr::Class(class(&[
+            ('\u{a000}', '\u{a48c}'), ('\u{a490}', '\u{a4c6}')
+        ]).case_fold()));
+    }
+
+    #[test]
+    fn escape_unicode_letter_case_fold() {
+        assert_eq!(p(r"(?i)\pZ"), Expr::Class(class(&[
+            ('\u{20}', '\u{20}'), ('\u{a0}', '\u{a0}'),
+            ('\u{1680}', '\u{1680}'), ('\u{2000}', '\u{200a}'),
+            ('\u{2028}', '\u{2029}'), ('\u{202f}', '\u{202f}'),
+            ('\u{205f}', '\u{205f}'), ('\u{3000}', '\u{3000}'),
+        ]).case_fold()));
+    }
+
+    #[test]
+    fn escape_unicode_name_negate() {
+        assert_eq!(p(r"\P{Yi}"), Expr::Class(class(&[
+            ('\u{a000}', '\u{a48c}'), ('\u{a490}', '\u{a4c6}')
+        ]).negate()));
+    }
+
+    #[test]
+    fn escape_unicode_letter_negate() {
+        assert_eq!(p(r"\PZ"), Expr::Class(class(&[
+            ('\u{20}', '\u{20}'), ('\u{a0}', '\u{a0}'),
+            ('\u{1680}', '\u{1680}'), ('\u{2000}', '\u{200a}'),
+            ('\u{2028}', '\u{2029}'), ('\u{202f}', '\u{202f}'),
+            ('\u{205f}', '\u{205f}'), ('\u{3000}', '\u{3000}'),
+        ]).negate()));
+    }
+
+    #[test]
+    fn escape_unicode_name_negate_case_fold() {
+        assert_eq!(p(r"(?i)\P{Yi}"), Expr::Class(class(&[
+            ('\u{a000}', '\u{a48c}'), ('\u{a490}', '\u{a4c6}')
+        ]).negate().case_fold()));
+    }
+
+    #[test]
+    fn escape_unicode_letter_negate_case_fold() {
+        assert_eq!(p(r"(?i)\PZ"), Expr::Class(class(&[
+            ('\u{20}', '\u{20}'), ('\u{a0}', '\u{a0}'),
+            ('\u{1680}', '\u{1680}'), ('\u{2000}', '\u{200a}'),
+            ('\u{2028}', '\u{2029}'), ('\u{202f}', '\u{202f}'),
+            ('\u{205f}', '\u{205f}'), ('\u{3000}', '\u{3000}'),
+        ]).negate().case_fold()));
+    }
+
+    #[test]
+    fn escape_perl_d() {
+        assert_eq!(p(r"\d"), Expr::Class(class(PERLD)));
+    }
+
+    #[test]
+    fn escape_perl_s() {
+        assert_eq!(p(r"\s"), Expr::Class(class(PERLS)));
+    }
+
+    #[test]
+    fn escape_perl_w() {
+        assert_eq!(p(r"\w"), Expr::Class(class(PERLW)));
+    }
+
+    #[test]
+    fn escape_perl_d_negate() {
+        assert_eq!(p(r"\D"), Expr::Class(class(PERLD).negate()));
+    }
+
+    #[test]
+    fn escape_perl_s_negate() {
+        assert_eq!(p(r"\S"), Expr::Class(class(PERLS).negate()));
+    }
+
+    #[test]
+    fn escape_perl_w_negate() {
+        assert_eq!(p(r"\W"), Expr::Class(class(PERLW).negate()));
+    }
+
+    #[test]
+    fn escape_perl_d_case_fold() {
+        assert_eq!(p(r"(?i)\d"), Expr::Class(class(PERLD).case_fold()));
+    }
+
+    #[test]
+    fn escape_perl_s_case_fold() {
+        assert_eq!(p(r"(?i)\s"), Expr::Class(class(PERLS).case_fold()));
+    }
+
+    #[test]
+    fn escape_perl_w_case_fold() {
+        assert_eq!(p(r"(?i)\w"), Expr::Class(class(PERLW).case_fold()));
+    }
+
+    #[test]
+    fn escape_perl_d_case_fold_negate() {
+        assert_eq!(p(r"(?i)\D"),
+                   Expr::Class(class(PERLD).negate().case_fold()));
+    }
+
+    #[test]
+    fn escape_perl_s_case_fold_negate() {
+        assert_eq!(p(r"(?i)\S"),
+                   Expr::Class(class(PERLS).negate().case_fold()));
+    }
+
+    #[test]
+    fn escape_perl_w_case_fold_negate() {
+        assert_eq!(p(r"(?i)\W"),
+                   Expr::Class(class(PERLW).negate().case_fold()));
+    }
+
     /******************************************************/
     // Test every single possible error case.
     /******************************************************/
@@ -1608,6 +1814,47 @@ mod tests {
             pos: 13,
             surround: r"99999}".into(),
             kind: ErrorKind::InvalidBase16("9999999999".into()),
+        });
+    }
+
+    #[test]
+    fn error_unicode_unclosed() {
+        assert_eq!(perr(r"\p{"), Error {
+            pos: 3,
+            surround: r"\p{".into(),
+            kind: ErrorKind::UnclosedUnicodeName,
+        });
+        assert_eq!(perr(r"\p{Greek"), Error {
+            pos: 8,
+            surround: r"Greek".into(),
+            kind: ErrorKind::UnclosedUnicodeName,
+        });
+    }
+
+    #[test]
+    fn error_unicode_no_letter() {
+        assert_eq!(perr(r"\p"), Error {
+            pos: 2,
+            surround: r"\p".into(),
+            kind: ErrorKind::UnexpectedEscapeEof,
+        });
+    }
+
+    #[test]
+    fn error_unicode_unknown_letter() {
+        assert_eq!(perr(r"\pA"), Error {
+            pos: 3,
+            surround: r"\pA".into(),
+            kind: ErrorKind::UnrecognizedUnicodeClass("A".into()),
+        });
+    }
+
+    #[test]
+    fn error_unicode_unknown_name() {
+        assert_eq!(perr(r"\p{Yii}"), Error {
+            pos: 7,
+            surround: r"{Yii}".into(),
+            kind: ErrorKind::UnrecognizedUnicodeClass("Yii".into()),
         });
     }
 }
